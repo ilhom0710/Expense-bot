@@ -1,0 +1,97 @@
+import os
+import sqlite3
+from datetime import datetime
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+from openai import OpenAI
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# DATABASE
+conn = sqlite3.connect("expenses.db", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    amount INTEGER,
+    category TEXT,
+    date TEXT
+)
+""")
+conn.commit()
+
+# 🎤 OVOZ → MATN
+async def speech_to_text(file_path):
+    with open(file_path, "rb") as f:
+        transcript = client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",
+            file=f
+        )
+    return transcript.text
+
+# 🧠 MATN → MA’LUMOT
+def analyze_text(text):
+    prompt = f"""
+    Extract expense info:
+    "{text}"
+
+    Return JSON:
+    amount, category (uzbek)
+    """
+
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    import json
+    return json.loads(res.choices[0].message.content)
+
+# 💾 SAVE
+def save_expense(amount, category):
+    cursor.execute(
+        "INSERT INTO expenses (amount, category, date) VALUES (?, ?, ?)",
+        (amount, category, datetime.now().strftime("%Y-%m-%d"))
+    )
+    conn.commit()
+
+# 🎤 HANDLER
+async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file = await update.message.voice.get_file()
+    await file.download_to_drive("voice.ogg")
+
+    text = await speech_to_text("voice.ogg")
+    data = analyze_text(text)
+
+    save_expense(data["amount"], data["category"])
+
+    await update.message.reply_text(
+        f"Qo‘shildi: {data['amount']} so‘m ({data['category']})"
+    )
+
+# 📊 HISOBOT
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cursor.execute("SELECT SUM(amount) FROM expenses")
+    total = cursor.fetchone()[0] or 0
+    await update.message.reply_text(f"Umumiy: {total} so‘m")
+
+# 📅 OYLIK
+async def monthly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cursor.execute("SELECT category, SUM(amount) FROM expenses GROUP BY category")
+    rows = cursor.fetchall()
+
+    text = "Oylik:\n"
+    for r in rows:
+        text += f"{r[0]}: {r[1]} so‘m\n"
+
+    await update.message.reply_text(text)
+
+# 🚀 RUN
+app = ApplicationBuilder().token(os.getenv("TELEGRAM_TOKEN")).build()
+
+app.add_handler(MessageHandler(filters.VOICE, voice_handler))
+app.add_handler(CommandHandler("hisobot", report))
+app.add_handler(CommandHandler("oylik", monthly))
+
+app.run_polling()
